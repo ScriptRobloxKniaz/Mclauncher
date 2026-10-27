@@ -1,0 +1,92 @@
+name: Build APK
+
+# Собирает debug-APK при каждом коммите (push в любую ветку), при pull request
+# и по кнопке «Run workflow» (для запуска с телефона).
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Если проект лежит в корне репозитория (есть settings.gradle.kts) — собираем его.
+      # Если в репозитории только zip с проектом — распаковываем его и собираем распакованное.
+      - name: Locate project
+        run: |
+          if [ -f settings.gradle.kts ]; then
+            echo "PROJECT_DIR=." >> "$GITHUB_ENV"
+          else
+            zip_file="$(find . -maxdepth 2 -name '*.zip' -not -path './_src/*' -print -quit)"
+            if [ -z "$zip_file" ]; then echo "No settings.gradle.kts and no zip found"; exit 1; fi
+            echo "Unpacking: $zip_file"
+            mkdir -p _src
+            unzip -q -o "$zip_file" -d _src
+            settings="$(find _src -name settings.gradle.kts -not -path '*/node_modules/*' | head -n 1)"
+            if [ -z "$settings" ]; then echo "settings.gradle.kts not found inside zip"; exit 1; fi
+            echo "PROJECT_DIR=$(dirname "$settings")" >> "$GITHUB_ENV"
+          fi
+          cat "$GITHUB_ENV"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      # В проекте нет gradlew / gradle-wrapper.jar, поэтому Gradle ставится отдельно.
+      # Версия та же, что в gradle/wrapper/gradle-wrapper.properties.
+      - name: Set up Gradle 9.6.0
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.6.0
+
+      # Если gradlew появится в проекте — даём ему право на исполнение.
+      - name: Make gradlew executable (if present)
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          if [ -f gradlew ]; then chmod +x gradlew; echo "gradlew: +x"; else echo "gradlew not found, using setup-gradle"; fi
+
+      - name: Build debug APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: gradle --no-daemon --stacktrace :app:assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: mclauncher-debug-apk
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      # Необязательно: скачать настоящие файлы Mojang, чтобы RealFixturesTest не пропускался.
+      - name: Fetch real Mojang fixtures (optional)
+        working-directory: ${{ env.PROJECT_DIR }}
+        continue-on-error: true
+        run: python3 -I scripts/fetch_fixtures.py
+
+      # Тесты идут ПОСЛЕ загрузки APK: упавший тест не лишает вас готового APK.
+      - name: Unit tests
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: gradle --no-daemon --stacktrace :app:testDebugUnitTest
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-report
+          path: ${{ env.PROJECT_DIR }}/app/build/reports/tests/testDebugUnitTest/
+          if-no-files-found: ignore
+          retention-days: 7
