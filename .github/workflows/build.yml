@@ -21,8 +21,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      # Если проект лежит в корне репозитория (есть settings.gradle.kts) — собираем его.
-      # Если в репозитории только zip с проектом — распаковываем его и собираем распакованное.
       - name: Locate project
         run: |
           if [ -f settings.gradle.kts ]; then
@@ -39,13 +37,18 @@ jobs:
           fi
           cat "$GITHUB_ENV"
 
-      # Compose 1.12.1 (из BOM 2026.09.00) требует compileSdk 37; AGP 9.4 его поддерживает.
-      # Правим только если там ещё 36. Когда поменяете compileSdk в самом проекте, шаг можно удалить.
       - name: Raise compileSdk to 37
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           sed -i 's/compileSdk = 36\b/compileSdk = 37/' app/build.gradle.kts
           grep -n "compileSdk" app/build.gradle.kts
+
+      - name: Fix SkinsScreen maxHeight receiver
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          f=app/src/main/java/com/mclauncher/app/ui/skins/SkinsScreen.kt
+          sed -i 's/(maxHeight - 96\.dp)/(this@BoxWithConstraints.maxHeight - 96.dp)/' "$f"
+          grep -n "maxHeight - 96" "$f"
 
       - name: Set up JDK 17
         uses: actions/setup-java@v5
@@ -53,8 +56,6 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      # gradlew в проекте нет, поэтому Gradle ставится отдельно.
-      # Версия 9.6.0 существует и НЕ должна быть ниже: AGP 9.4 требует Gradle 9.6.0 как минимум.
       - name: Set up Gradle 9.6.0
         uses: gradle/actions/setup-gradle@v5
         with:
@@ -77,13 +78,11 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      # Необязательно: скачать настоящие файлы Mojang, чтобы RealFixturesTest не пропускался.
       - name: Fetch real Mojang fixtures (optional)
         working-directory: ${{ env.PROJECT_DIR }}
         continue-on-error: true
         run: python3 -I scripts/fetch_fixtures.py
 
-      # Тесты идут ПОСЛЕ загрузки APK: упавший тест не лишает вас готового APK.
       - name: Unit tests
         working-directory: ${{ env.PROJECT_DIR }}
         run: gradle --no-daemon --stacktrace :app:testDebugUnitTest
@@ -96,4 +95,3 @@ jobs:
           path: ${{ env.PROJECT_DIR }}/app/build/reports/tests/testDebugUnitTest/
           if-no-files-found: ignore
           retention-days: 7
-          
