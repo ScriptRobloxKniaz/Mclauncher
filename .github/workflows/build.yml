@@ -1,6 +1,11 @@
 name: Build APK
 
 # Собирает debug-APK при каждом коммите, при pull request и по кнопке «Run workflow».
+#
+# Исходники могут лежать двумя способами:
+#   1) прямо в корне репозитория (есть settings.gradle.kts) — собирается он;
+#   2) внутри zip-архива проекта — берётся архив с наибольшим номером в имени, распаковывается и собирается.
+# Исправления в коде делаются в коде, а не командами sed внутри workflow.
 on:
   push:
   pull_request:
@@ -16,7 +21,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -26,7 +31,8 @@ jobs:
           if [ -f settings.gradle.kts ]; then
             echo "PROJECT_DIR=." >> "$GITHUB_ENV"
           else
-            zip_file="$(find . -maxdepth 2 -name '*.zip' -not -path './_src/*' -print -quit)"
+            # Если архивов несколько, берём последний по версионной сортировке имён (4.7 новее 4.6).
+            zip_file="$(find . -maxdepth 2 -name '*.zip' -not -path './_src/*' | sort -V | tail -n 1)"
             if [ -z "$zip_file" ]; then echo "No settings.gradle.kts and no zip found"; exit 1; fi
             echo "Unpacking: $zip_file"
             mkdir -p _src
@@ -37,18 +43,9 @@ jobs:
           fi
           cat "$GITHUB_ENV"
 
-      - name: Raise compileSdk to 37
+      - name: Show SDK levels
         working-directory: ${{ env.PROJECT_DIR }}
-        run: |
-          sed -i 's/compileSdk = 36\b/compileSdk = 37/' app/build.gradle.kts
-          grep -n "compileSdk" app/build.gradle.kts
-
-      - name: Fix SkinsScreen maxHeight receiver
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: |
-          f=app/src/main/java/com/mclauncher/app/ui/skins/SkinsScreen.kt
-          sed -i 's/(maxHeight - 96\.dp)/(this@BoxWithConstraints.maxHeight - 96.dp)/' "$f"
-          grep -n "maxHeight - 96" "$f"
+        run: grep -n "compileSdk\|targetSdk\|minSdk" app/build.gradle.kts
 
       - name: Set up JDK 17
         uses: actions/setup-java@v5
