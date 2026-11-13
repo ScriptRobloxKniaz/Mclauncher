@@ -1,11 +1,21 @@
 name: Build APK
 
+# ВАЖНО: GitHub запускает ТОЛЬКО этот файл из корня репозитория (.github/workflows/build.yml). Копия внутри zip с проектом
+# не запускается никогда — именно поэтому изменения CI до шага 19 на сборку не влияли: в репозитории оставался старый
+# workflow, собиравший только обычный APK без ядра. Файл меняется вручную (заменой в репозитории); всё, что может
+# понадобиться чинить, вынесено в скрипты scripts/ci_*.{py,sh}, которые приезжают вместе с проектом.
+#
 # Собирает debug-APK при каждом коммите, при pull request и по кнопке «Run workflow».
 #
 # Исходники могут лежать двумя способами:
 #   1) прямо в корне репозитория (есть settings.gradle.kts) — собирается он;
 #   2) внутри zip-архива проекта — берётся архив с наибольшим номером в имени, распаковывается и собирается.
-# Исправления в коде делаются в коде, а не командами sed внутри workflow.
+#
+# Что получается на выходе. APK в Artifacts ровно ОДИН, и он появляется только после проверки содержимого:
+#   - всё собралось (ядро + нативная часть)  → артефакт «INSTALL-THIS-mclauncher-full»;
+#   - что-то не собралось → запуск красный, артефакт один: «BROKEN-APK-no-game-press-Play-send-report». Игру он не
+#     запускает, но в нём записана причина сбоя: нажмите «Играть» и пришлите отчёт («Скопировать отчёт»).
+# Логи всех этапов — в артефакте «ci-logs». Тесты не мешают получить APK, но если они красные, запуск тоже красный.
 on:
   push:
   pull_request:
@@ -45,7 +55,7 @@ jobs:
 
       - name: Show SDK levels
         working-directory: ${{ env.PROJECT_DIR }}
-        run: grep -n "compileSdk\|targetSdk\|minSdk" app/build.gradle.kts
+        run: grep -n "compileSdk\|targetSdk\|minSdk" app/build.gradle.kts engine/build.gradle.kts
 
       - name: Set up JDK 17
         uses: actions/setup-java@v5
@@ -63,32 +73,254 @@ jobs:
         run: |
           if [ -f gradlew ]; then chmod +x gradlew; echo "gradlew: +x"; else echo "gradlew not found, using setup-gradle"; fi
 
-      - name: Build debug APK
+      # Этот файл меняется вручную, а проект приезжает zip-ом, поэтому они могут разойтись (так уже было: шаги 15–18 «не
+      # работали», потому что в репозитории лежал старый workflow). Расхождение — предупреждение и строка в отчёте о сбое.
+      - name: Check that this workflow matches the project copy (optional)
         working-directory: ${{ env.PROJECT_DIR }}
-        run: gradle --no-daemon --stacktrace :app:assembleDebug
+        continue-on-error: true
+        run: |
+          mkdir -p ci-logs
+          repo_copy="$GITHUB_WORKSPACE/.github/workflows/build.yml"
+          project_copy=".github/workflows/build.yml"
+          if [ ! -f "$project_copy" ]; then
+            echo "В проекте нет .github/workflows/build.yml — сравнивать не с чем."
+          elif cmp -s "$repo_copy" "$project_copy"; then
+            echo "workflow в репозитории совпадает с копией в проекте."
+          else
+            msg="workflow в репозитории (.github/workflows/build.yml) ОТЛИЧАЕТСЯ от копии в проекте: часть изменений CI не применяется. Замените файл в репозитории файлом из проекта."
+            echo "::warning title=Устаревший workflow::$msg"
+            echo "$msg" > ci-logs/workflow-drift.txt
+          fi
 
-      - name: Upload APK
-        uses: actions/upload-artifact@v5
-        with:
-          name: mclauncher-debug-apk
-          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
-          if-no-files-found: error
-          retention-days: 30
+      # --- Проверки без сборки (не влияют на результат, но их вывод помогает найти причину) ---
+
+      # Проверяет, что закреплённая ревизия ядра (engine/UPSTREAM) доступна и в ней есть все файлы, на которые опирается :engine.
+      - name: Check core upstream (optional)
+        working-directory: ${{ env.PROJECT_DIR }}
+        continue-on-error: true
+        run: python3 -I scripts/fetch_core.py
+
+      # Рендереры скачиваются на устройстве по манифесту из ассетов; шаг сверяет его с закреплённой ревизией апстрима.
+      - name: Check renderer manifest (optional)
+        working-directory: ${{ env.PROJECT_DIR }}
+        continue-on-error: true
+        run: python3 -I scripts/fetch_core.py --check-renderer-manifest
+
+      # Сверяет Android.mk с файлами нативной части (engine/src/main/jni) без NDK.
+      - name: Check native sources (optional)
+        working-directory: ${{ env.PROJECT_DIR }}
+        continue-on-error: true
+        run: python3 -I scripts/check_native.py
+
+      # Сверяет Java-мост с нативным кодом: имена и сигнатуры native-методов и обратных вызовов.
+      - name: Check Java bridge against native code (optional)
+        working-directory: ${{ env.PROJECT_DIR }}
+        continue-on-error: true
+        run: python3 -I scripts/check_bridge.py
+
+      # Самопроверка скриптов, которыми CI описывает сбой и проверяет APK.
+      - name: Self-test CI scripts (optional)
+        working-directory: ${{ env.PROJECT_DIR }}
+        continue-on-error: true
+        run: |
+          python3 -I scripts/ci_build_status.py --self-test
+          python3 -I scripts/ci_check_apk.py --self-test
+
+      # --- Тесты. Идут до скачивания файлов ядра (как и раньше), но APK не блокируют: упали — запуск красный в конце. ---
 
       - name: Fetch real Mojang fixtures (optional)
         working-directory: ${{ env.PROJECT_DIR }}
         continue-on-error: true
         run: python3 -I scripts/fetch_fixtures.py
 
-      - name: Unit tests
+      - name: Unit tests (app + engine)
+        id: tests
         working-directory: ${{ env.PROJECT_DIR }}
-        run: gradle --no-daemon --stacktrace :app:testDebugUnitTest
+        continue-on-error: true
+        run: gradle --no-daemon --console=plain --stacktrace --continue :app:testDebugUnitTest :engine:testDebugUnitTest
+
+      # --- Сборка, которая запускает игру. Этапы идут по порядку, у каждого свой лог в ci-logs/. ---
+
+      # Файлы ядра (рантаймы Java 8/17/21, LWJGL, OpenAL; около 110 МБ в APK) забирает scripts/fetch_core.py --install
+      # из закреплённой ревизии (engine/UPSTREAM); в git они не хранятся.
+      - name: Fetch game core files
+        id: core
+        working-directory: ${{ env.PROJECT_DIR }}
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          mkdir -p ci-logs
+          python3 -I scripts/fetch_core.py --install 2>&1 | tee ci-logs/core-fetch.log
+
+      # Нативная часть (C-код из engine/src/main/jni, ndk-build) собирается с NDK 25.2.9519653, как в апстриме.
+      - name: Install NDK 25.2.9519653
+        id: ndk
+        if: steps.core.outcome == 'success'
+        working-directory: ${{ env.PROJECT_DIR }}
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          mkdir -p ci-logs
+          bash scripts/ci_install_ndk.sh 25.2.9519653 2>&1 | tee ci-logs/ndk-install.log
+
+      - name: Build debug APK with the game core and natives
+        id: native
+        if: steps.ndk.outcome == 'success'
+        working-directory: ${{ env.PROJECT_DIR }}
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          mkdir -p ci-logs
+          rm -f app/build/outputs/apk/debug/*.apk
+          gradle --no-daemon --console=plain --stacktrace -Pmclauncher.native=true :app:assembleDebug 2>&1 | tee ci-logs/native-build.log
+
+      # Gradle мог завершиться успешно, а нативная часть в APK не попасть: смотрим на сам файл, а не на статус сборки.
+      - name: Check that the APK contains the game core
+        id: verify
+        if: steps.native.outcome == 'success'
+        working-directory: ${{ env.PROJECT_DIR }}
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          mkdir -p ci-logs
+          apk="$(ls app/build/outputs/apk/debug/*.apk | head -n 1)"
+          python3 -I scripts/ci_check_apk.py "$apk" 2>&1 | tee ci-logs/apk-check.log
+
+      - name: Name the full APK
+        if: steps.verify.outcome == 'success'
+        run: |
+          mkdir -p "$PROJECT_DIR/dist/full"
+          cp "$(ls "$PROJECT_DIR"/app/build/outputs/apk/debug/*.apk | head -n 1)" "$PROJECT_DIR/dist/full/MCLauncher-FULL-INSTALL-THIS.apk"
+
+      - name: Upload the full APK
+        if: steps.verify.outcome == 'success'
+        uses: actions/upload-artifact@v5
+        with:
+          name: INSTALL-THIS-mclauncher-full
+          path: ${{ env.PROJECT_DIR }}/dist/full/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      # --- Если полная сборка не получилась: запасной APK с причиной сбоя внутри. ---
+
+      - name: Write the failure report into the app
+        id: status
+        if: ${{ !cancelled() && steps.verify.outcome != 'success' }}
+        working-directory: ${{ env.PROJECT_DIR }}
+        continue-on-error: true
+        run: |
+          mkdir -p ci-logs
+          python3 -I scripts/ci_build_status.py \
+            --core "${{ steps.core.outcome }}" --ndk "${{ steps.ndk.outcome }}" \
+            --native "${{ steps.native.outcome }}" --verify "${{ steps.verify.outcome }}" \
+            --log-dir ci-logs --out app/src/main/assets/build-status.txt \
+            --run "${{ github.run_id }}" --sha "${{ github.sha }}"
+          cp app/src/main/assets/build-status.txt ci-logs/build-status.txt
+
+      - name: Build the fallback APK (no game, carries the failure report)
+        id: fallback
+        if: ${{ !cancelled() && steps.verify.outcome != 'success' }}
+        working-directory: ${{ env.PROJECT_DIR }}
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          mkdir -p ci-logs
+          rm -f app/build/outputs/apk/debug/*.apk
+          gradle --no-daemon --console=plain --stacktrace :app:assembleDebug 2>&1 | tee ci-logs/fallback-build.log
+
+      - name: Name the fallback APK
+        if: steps.fallback.outcome == 'success'
+        run: |
+          mkdir -p "$PROJECT_DIR/dist/broken"
+          cp "$(ls "$PROJECT_DIR"/app/build/outputs/apk/debug/*.apk | head -n 1)" "$PROJECT_DIR/dist/broken/MCLauncher-BROKEN-no-game-press-Play-send-report.apk"
+
+      - name: Upload the fallback APK
+        if: steps.fallback.outcome == 'success'
+        uses: actions/upload-artifact@v5
+        with:
+          name: BROKEN-APK-no-game-press-Play-send-report
+          path: ${{ env.PROJECT_DIR }}/dist/broken/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload CI logs
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: ci-logs
+          path: ${{ env.PROJECT_DIR }}/ci-logs/
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Upload test report
         if: always()
         uses: actions/upload-artifact@v5
         with:
           name: unit-test-report
-          path: ${{ env.PROJECT_DIR }}/app/build/reports/tests/testDebugUnitTest/
+          path: |
+            ${{ env.PROJECT_DIR }}/app/build/reports/tests/testDebugUnitTest/
+            ${{ env.PROJECT_DIR }}/engine/build/reports/tests/testDebugUnitTest/
           if-no-files-found: ignore
           retention-days: 7
+
+      # Сводка на странице запуска (вкладка Summary): какой APK ставить и что именно не сработало.
+      - name: Summary - which APK to install
+        if: always()
+        continue-on-error: true
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          CORE_FETCH: ${{ steps.core.outcome }}
+          NDK: ${{ steps.ndk.outcome }}
+          NATIVE_BUILD: ${{ steps.native.outcome }}
+          VERIFY: ${{ steps.verify.outcome }}
+          TESTS: ${{ steps.tests.outcome }}
+        run: |
+          {
+            echo '## Какой APK ставить на телефон'
+            echo
+            if [ "$VERIFY" = "success" ]; then
+              echo 'Ставьте артефакт **INSTALL-THIS-mclauncher-full**. Он единственный APK в этом запуске и запускает игру. После установки: Настройки → Игровое ядро → Установить ядро.'
+            else
+              echo '**Сборки, которая запускает игру, в этом запуске нет.** Артефакт `BROKEN-APK-no-game-press-Play-send-report` (если он есть) игру не запускает: поставьте его, нажмите «Играть» и пришлите отчёт — причина сбоя записана внутри.'
+            fi
+            echo
+            echo '| Шаг | Результат |'
+            echo '|---|---|'
+            echo "| Unit tests (app + engine) | $TESTS |"
+            echo "| Fetch game core files | $CORE_FETCH |"
+            echo "| Install NDK | $NDK |"
+            echo "| Build APK with the core and natives | $NATIVE_BUILD |"
+            echo "| Check that the APK contains the game core | $VERIFY |"
+            echo
+            echo '`skipped` — шаг не запускался, потому что предыдущий не удался.'
+            if [ -f ci-logs/build-status.txt ]; then
+              echo
+              echo '### Причина сбоя'
+              echo '```'
+              cat ci-logs/build-status.txt
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Этапы выше не роняют запуск сами (continue-on-error), чтобы после сбоя успел собраться запасной APK и выгрузиться
+      # лог. Поэтому в конце запуск делается красным, если полной сборки нет или тесты не прошли; причина — в аннотации.
+      - name: Fail the run if something went wrong
+        if: always() && (steps.verify.outcome != 'success' || steps.tests.outcome != 'success')
+        env:
+          CORE_FETCH: ${{ steps.core.outcome }}
+          NDK: ${{ steps.ndk.outcome }}
+          NATIVE_BUILD: ${{ steps.native.outcome }}
+          VERIFY: ${{ steps.verify.outcome }}
+          TESTS: ${{ steps.tests.outcome }}
+        run: |
+          if [ "$VERIFY" = "success" ]; then
+            echo "::error title=Тесты не прошли::APK собран и лежит в артефакте INSTALL-THIS-mclauncher-full, но юнит-тесты красные: смотрите шаг Unit tests и артефакт unit-test-report."
+            exit 1
+          fi
+          if [ "$CORE_FETCH" != "success" ]; then stage='Fetch game core files'
+          elif [ "$NDK" != "success" ]; then stage='Install NDK 25.2.9519653'
+          elif [ "$NATIVE_BUILD" != "success" ]; then stage='Build debug APK with the game core and natives'
+          else stage='Check that the APK contains the game core'
+          fi
+          echo "::error title=Нет APK, который запускает игру::Не сработал шаг «$stage». Скачайте артефакт BROKEN-APK-no-game-press-Play-send-report, нажмите в приложении «Играть» и пришлите отчёт; логи этапов — в артефакте ci-logs."
+          exit 1
